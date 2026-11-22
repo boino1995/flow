@@ -1,4 +1,6 @@
 import asyncio
+from collections import deque
+from datetime import datetime, timezone
 import os
 import re
 import shutil
@@ -6,24 +8,29 @@ import subprocess
 import time
 import xml.etree.ElementTree as ET
 from urllib.parse import urljoin
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, PlainTextResponse
 import httpx
 
-app = FastAPI(title="ClearKey MPD to HLS Restreamer")
+app = FastAPI(title="Live ClearKey MPD to HLS Restreamer")
 
 HLS_DIR = os.getenv("HLS_DIR", "/tmp/hls")
+WORK_DIR = os.getenv("WORK_DIR", "/tmp/dash_work")
 DEFAULT_MPD = os.getenv("MPD_URL", "")
 DEFAULT_KEYS = os.getenv("CLEAR_KEYS", "")
 DEFAULT_UA = os.getenv("USER_AGENT", "Mozilla/5.0")
 DEFAULT_REFERER = os.getenv("REFERER", "")
 DEFAULT_AUTH = os.getenv("AUTH_HEADER", "")
+POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2.0"))
 IDLE_TIMEOUT_SEC = int(os.getenv("IDLE_TIMEOUT_SEC", "35"))
+LIVE_LOOKBACK_SEGS = int(os.getenv("LIVE_LOOKBACK_SEGS", "2"))
 
 os.makedirs(HLS_DIR, exist_ok=True)
+os.makedirs(WORK_DIR, exist_ok=True)
 
 state = {
     "proc": None,
+    "poll_task": None,
     "active_key": None,
     "last_request": 0.0,
     "lock": asyncio.Lock(),
@@ -42,7 +49,6 @@ def build_headers(referer: str = "", auth: str = "", ua: str = "") -> dict[str, 
 
 
 def normalize_keys(raw_keys: str) -> list[str]:
-    # Accepts "kid:key" or "kid:key,kid2:key2" (strips dashes/spaces)
     pairs = []
     for item in (raw_keys or "").split(","):
         item = item.strip()
@@ -66,20 +72,32 @@ def resolve_template(template: str, base_url: str, rep_id: str, bandwidth: str, 
     return urljoin(base_url, url)
 
 
-async def fetch_dash_segments(mpd_url: str, keys: list[str], headers: dict[str, str], work_dir: str) -> list[str]:
-    """Fetches MPD, downloads init + latest segment(s), decrypts with mp4decrypt, returns decrypted file paths."""
-    async with httpx.AsyncClient(headers=headers, timeout=15.0, follow_redirects=True) as client:
-        resp = await client.get(mpd_url)
-        resp.raise_for_status()
-        root = ET.fromstring(resp.text)
+def decrypt_file(src_path: str, dst_path: str, keys: list[str]) -> None:
+    if not keys:
+        shutil.copyfile(src_path, dst_path)
+        return
+    cmd = ["mp4decrypt"]
+    for k in keys:
+        cmd.extend(["--key", k])
+    cmd.extend([src_path, dst_path])
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"mp4decrypt failed: {res.stderr.strip()}")
 
+
+def parse_live_candidates(mpd_xml: str, mpd_url: str) -> tuple[str | None, list[tuple[str, str]]]:
+    """
+    Returns (init_url, [(seg_token, media_url), ...]) for the primary video Representation.
+    Supports both $Number$ / $Number%0Nd$ and $Time$ / SegmentTimeline manifests.
+    """
+    root = ET.fromstring(mpd_xml)
     ns = {"mpd": "urn:mpeg:dash:schema:mpd:2011"}
+
     base_url = mpd_url
     base_el = root.find("mpd:BaseURL", ns)
     if base_el is not None and base_el.text:
         base_url = urljoin(mpd_url, base_el.text.strip())
 
-    # Pick first video AdaptationSet and first Representation
     video_as = None
     for aset in root.findall(".//mpd:AdaptationSet", ns):
         mime = aset.attrib.get("mimeType", "")
@@ -101,86 +119,122 @@ async def fetch_dash_segments(mpd_url: str, keys: list[str], headers: dict[str, 
 
     seg_tpl = rep.find("mpd:SegmentTemplate", ns) or video_as.find("mpd:SegmentTemplate", ns)
     if seg_tpl is None:
-        raise RuntimeError("Only SegmentTemplate DASH streams are handled by this starter script")
+        raise RuntimeError("SegmentTemplate not found in MPD")
 
     init_tpl = seg_tpl.attrib.get("initialization", "")
     media_tpl = seg_tpl.attrib.get("media", "")
-    start_num = int(seg_tpl.attrib.get("startNumber", "1"))
+    if not media_tpl:
+        raise RuntimeError("Media template missing in SegmentTemplate")
 
-    # If SegmentTimeline exists, grab the last entry's start time / repeat
+    start_num = int(seg_tpl.attrib.get("startNumber", "1"))
+    init_url = resolve_template(init_tpl, base_url, rep_id, bandwidth, start_num, 0) if init_tpl else None
+
     timeline = seg_tpl.find("mpd:SegmentTimeline", ns)
-    cur_time = 0
-    seg_number = start_num
+    candidates: list[tuple[str, str]] = []
+
     if timeline is not None:
-        cur_num = start_num
+        cur_time = 0
+        seg_num = start_num
+        entries: list[tuple[str, str]] = []
         for s in timeline.findall("mpd:S", ns):
             t_attr = s.attrib.get("t")
             if t_attr is not None:
                 cur_time = int(t_attr)
             d_val = int(s.attrib.get("d", "0"))
             r_val = int(s.attrib.get("r", "0"))
-            # Advance to near the live edge
-            if r_val > 0:
-                cur_time += d_val * r_val
-                cur_num += r_val
-            seg_number = cur_num
-            cur_time += d_val
-            cur_num += 1
+            repeat_count = r_val + 1 if r_val >= 0 else 1
+            for _ in range(repeat_count):
+                token = f"t:{cur_time}|n:{seg_num}"
+                m_url = resolve_template(media_tpl, base_url, rep_id, bandwidth, seg_num, cur_time)
+                entries.append((token, m_url))
+                cur_time += d_val
+                seg_num += 1
+        candidates = entries[-max(1, LIVE_LOOKBACK_SEGS):]
+    else:
+        duration = float(seg_tpl.attrib.get("duration", "4"))
+        timescale = float(seg_tpl.attrib.get("timescale", "1"))
+        seg_sec = max(1.0, duration / max(1.0, timescale))
+        avail_start_raw = root.attrib.get("availabilityStartTime", "")
+        now_epoch = time.time()
+        est_current = start_num
+        if avail_start_raw:
+            try:
+                dt = datetime.fromisoformat(avail_start_raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+                elapsed = max(0.0, now_epoch - dt.timestamp())
+                est_current = start_num + int(elapsed // seg_sec)
+            except Exception:
+                pass
+        first_num = max(start_num, est_current - max(1, LIVE_LOOKBACK_SEGS) + 1)
+        for n in range(first_num, est_current + 1):
+            candidates.append((f"n:{n}", resolve_template(media_tpl, base_url, rep_id, bandwidth, n, 0)))
 
-    decrypted_paths = []
-    async with httpx.AsyncClient(headers=headers, timeout=15.0, follow_redirects=True) as client:
-        init_dec = os.path.join(work_dir, "init_dec.mp4")
-        if init_tpl:
-            init_url = resolve_template(init_tpl, base_url, rep_id, bandwidth, seg_number, cur_time)
-            init_enc = os.path.join(work_dir, "init_enc.m4s")
-            r_init = await client.get(init_url)
-            r_init.raise_for_status()
-            with open(init_enc, "wb") as f:
-                f.write(r_init.content)
-            decrypt_file(init_enc, init_dec, keys)
-            decrypted_paths.append(init_dec)
-
-        media_url = resolve_template(media_tpl, base_url, rep_id, bandwidth, seg_number, cur_time)
-        media_enc = os.path.join(work_dir, f"seg_{seg_number}_enc.m4s")
-        media_dec = os.path.join(work_dir, f"seg_{seg_number}_dec.m4s")
-        r_seg = await client.get(media_url)
-        r_seg.raise_for_status()
-        with open(media_enc, "wb") as f:
-            f.write(r_seg.content)
-        decrypt_file(media_enc, media_dec, keys)
-        decrypted_paths.append(media_dec)
-
-    return decrypted_paths
+    return init_url, candidates
 
 
-def decrypt_file(src_path: str, dst_path: str, keys: list[str]) -> None:
-    if not keys:
-        shutil.copyfile(src_path, dst_path)
-        return
-    cmd = ["mp4decrypt"]
-    for k in keys:
-        cmd.extend(["--key", k])
-    cmd.extend([src_path, dst_path])
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    if res.returncode != 0:
-        raise RuntimeError(f"mp4decrypt failed: {res.stderr.strip()}")
+def write_pipe(pipe, data: bytes) -> bool:
+    if pipe is None or pipe.closed:
+        return False
+    try:
+        pipe.write(data)
+        pipe.flush()
+        return True
+    except (BrokenPipeError, OSError):
+        return False
 
 
-def stop_ffmpeg() -> None:
+async def download_and_decrypt(
+    client: httpx.AsyncClient,
+    url: str,
+    tag: str,
+    keys: list[str],
+) -> bytes:
+    enc_path = os.path.join(WORK_DIR, f"{tag}_enc.m4s")
+    dec_path = os.path.join(WORK_DIR, f"{tag}_dec.m4s")
+    try:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        with open(enc_path, "wb") as f:
+            f.write(resp.content)
+        decrypt_file(enc_path, dec_path, keys)
+        with open(dec_path, "rb") as f:
+            return f.read()
+    finally:
+        for p in (enc_path, dec_path):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                pass
+
+
+def stop_pipeline_sync() -> None:
+    task = state.get("poll_task")
+    if task and not task.done():
+        task.cancel()
+    state["poll_task"] = None
+
     proc = state.get("proc")
-    if proc and proc.poll() is None:
-        proc.terminate()
+    if proc:
         try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+            if proc.stdin and not proc.stdin.closed:
+                proc.stdin.close()
+        except OSError:
+            pass
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
     state["proc"] = None
     state["active_key"] = None
 
 
-def clean_hls_dir() -> None:
-    for name in os.listdir(HLS_DIR):
-        p = os.path.join(HLS_DIR, name)
+def clean_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+    for name in os.listdir(path):
+        p = os.path.join(path, name)
         try:
             if os.path.isdir(p):
                 shutil.rmtree(p, ignore_errors=True)
@@ -190,53 +244,82 @@ def clean_hls_dir() -> None:
             pass
 
 
+async def live_poller_loop(mpd_url: str, keys: list[str], headers: dict[str, str], proc: subprocess.Popen) -> None:
+    seen: deque[str] = deque(maxlen=256)
+    init_sent = False
+    cached_init_url: str | None = None
+
+    async with httpx.AsyncClient(headers=headers, timeout=10.0, follow_redirects=True) as client:
+        while proc.poll() is None:
+            try:
+                mpd_resp = await client.get(mpd_url)
+                mpd_resp.raise_for_status()
+                init_url, candidates = parse_live_candidates(mpd_resp.text, mpd_url)
+
+                if init_url and (not init_sent or init_url != cached_init_url):
+                    init_bytes = await download_and_decrypt(client, init_url, "init", keys)
+                    if not write_pipe(proc.stdin, init_bytes):
+                        break
+                    init_sent = True
+                    cached_init_url = init_url
+
+                for idx, (token, seg_url) in enumerate(candidates):
+                    if proc.poll() is not None:
+                        break
+                    if token in seen:
+                        continue
+                    seg_bytes = await download_and_decrypt(client, seg_url, f"seg_{idx}", keys)
+                    if not write_pipe(proc.stdin, seg_bytes):
+                        return
+                    seen.append(token)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                print(f"[poller] warning: {exc}")
+
+            await asyncio.sleep(POLL_INTERVAL_SEC)
+
+
 async def ensure_stream_running(mpd_url: str, raw_keys: str, headers: dict[str, str]) -> str:
     keys = normalize_keys(raw_keys)
     session_key = f"{mpd_url}|{'|'.join(keys)}"
+    out_m3u8 = os.path.join(HLS_DIR, "index.m3u8")
+    out_seg = os.path.join(HLS_DIR, "seg_%03d.ts")
 
     async with state["lock"]:
         state["last_request"] = time.time()
         proc = state.get("proc")
         if proc is not None and proc.poll() is None and state.get("active_key") == session_key:
-            return os.path.join(HLS_DIR, "index.m3u8")
+            return out_m3u8
 
-        stop_ffmpeg()
-        clean_hls_dir()
-
-        work_dir = os.path.join(HLS_DIR, "work")
-        os.makedirs(work_dir, exist_ok=True)
-
-        # Seed initial decrypted segment(s) and start rolling FFmpeg HLS muxer (-c copy)
-        dec_files = await fetch_dash_segments(mpd_url, keys, headers, work_dir)
-        seed_path = os.path.join(work_dir, "seed.mp4")
-        with open(seed_path, "wb") as out:
-            for p in dec_files:
-                with open(p, "rb") as inp:
-                    out.write(inp.read())
-
-        out_m3u8 = os.path.join(HLS_DIR, "index.m3u8")
-        out_seg = os.path.join(HLS_DIR, "seg_%03d.ts")
+        stop_pipeline_sync()
+        clean_dir(HLS_DIR)
+        clean_dir(WORK_DIR)
 
         ffmpeg_cmd = [
             "ffmpeg",
             "-loglevel", "error",
-            "-re",
-            "-i", seed_path,
+            "-fflags", "+genpts+discardcorrupt",
+            "-i", "pipe:0",
             "-c", "copy",
             "-f", "hls",
             "-hls_time", "4",
             "-hls_list_size", "6",
-            "-hls_flags", "delete_segments+append_list",
+            "-hls_flags", "delete_segments+append_list+omit_endlist",
             "-hls_segment_filename", out_seg,
             out_m3u8,
         ]
-        state["proc"] = subprocess.Popen(ffmpeg_cmd)
+        proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
+        state["proc"] = proc
         state["active_key"] = session_key
+        state["poll_task"] = asyncio.create_task(live_poller_loop(mpd_url, keys, headers, proc))
 
-        # Wait briefly for index.m3u8 to appear
-        for _ in range(30):
+        for _ in range(32):
             if os.path.exists(out_m3u8) and os.path.getsize(out_m3u8) > 0:
                 break
+            if proc.poll() is not None:
+                raise RuntimeError("FFmpeg exited before producing HLS segments")
             await asyncio.sleep(0.25)
 
         return out_m3u8
@@ -252,10 +335,17 @@ async def start_idle_watchdog():
                 if time.time() - state["last_request"] > IDLE_TIMEOUT_SEC:
                     async with state["lock"]:
                         if time.time() - state["last_request"] > IDLE_TIMEOUT_SEC:
-                            stop_ffmpeg()
-                            clean_hls_dir()
+                            stop_pipeline_sync()
+                            clean_dir(HLS_DIR)
+                            clean_dir(WORK_DIR)
 
     asyncio.create_task(watchdog())
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    async with state["lock"]:
+        stop_pipeline_sync()
 
 
 @app.get("/health")
@@ -292,16 +382,43 @@ async def stream_m3u8(
     with open(m3u8_path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    # Ensure relative segment paths work cleanly behind proxies
     return PlainTextResponse(content=content, media_type="application/vnd.apple.mpegurl")
 
 
-@app.get("/{segment_name}")
-async def get_segment(segment_name: str):
+@app.api_route("/{segment_name}", methods=["GET", "HEAD"])
+async def get_segment(segment_name: str, request: Request):
     state["last_request"] = time.time()
     if not re.fullmatch(r"seg_\d+\.ts", segment_name):
         raise HTTPException(status_code=404, detail="Not found")
+
     seg_path = os.path.join(HLS_DIR, segment_name)
     if not os.path.exists(seg_path):
         raise HTTPException(status_code=404, detail="Segment not found")
-    return FileResponse(seg_path, media_type="video/mp2t")
+
+    file_size = os.path.getsize(seg_path)
+    if file_size <= 0:
+        raise HTTPException(status_code=404, detail="Segment not ready")
+
+    # Strip Range header so players/sniffers don't trigger 416 on small/rolling TS segments
+    clean_headers = [(k, v) for k, v in request.scope.get("headers", []) if k.decode("latin1").lower() != "range"]
+    request.scope["headers"] = clean_headers
+
+    if request.method == "HEAD":
+        return Response(
+            status_code=200,
+            headers={
+                "Content-Type": "video/mp2t",
+                "Content-Length": str(file_size),
+                "Accept-Ranges": "none",
+                "Cache-Control": "no-cache",
+            },
+        )
+
+    return FileResponse(
+        seg_path,
+        media_type="video/mp2t",
+        headers={
+            "Accept-Ranges": "none",
+            "Cache-Control": "no-cache",
+        },
+    )
