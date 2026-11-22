@@ -9,7 +9,7 @@ import time
 import xml.etree.ElementTree as ET
 from urllib.parse import urljoin
 from fastapi import FastAPI, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 import httpx
 
 app = FastAPI(title="Live ClearKey MPD to HLS Restreamer")
@@ -31,8 +31,16 @@ os.makedirs(WORK_DIR, exist_ok=True)
 state = {
     "proc": None,
     "poll_task": None,
+    "stderr_task": None,
     "active_key": None,
+    "active_mpd": None,
     "last_request": 0.0,
+    "last_poll_at": None,
+    "last_error": None,
+    "init_sent": False,
+    "segments_piped": 0,
+    "bytes_piped": 0,
+    "ffmpeg_stderr": deque(maxlen=40),
     "lock": asyncio.Lock(),
 }
 
@@ -72,7 +80,7 @@ def resolve_template(template: str, base_url: str, rep_id: str, bandwidth: str, 
     return urljoin(base_url, url)
 
 
-def decrypt_file(src_path: str, dst_path: str, keys: list[str]) -> None:
+async def decrypt_file_async(src_path: str, dst_path: str, keys: list[str], timeout_sec: float = 10.0) -> None:
     if not keys:
         shutil.copyfile(src_path, dst_path)
         return
@@ -80,9 +88,22 @@ def decrypt_file(src_path: str, dst_path: str, keys: list[str]) -> None:
     for k in keys:
         cmd.extend(["--key", k])
     cmd.extend([src_path, dst_path])
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    if res.returncode != 0:
-        raise RuntimeError(f"mp4decrypt failed: {res.stderr.strip()}")
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError(f"mp4decrypt timed out after {timeout_sec}s")
+
+    if proc.returncode != 0:
+        err_msg = stderr_data.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"mp4decrypt failed (rc={proc.returncode}): {err_msg}")
 
 
 def parse_live_candidates(mpd_xml: str, mpd_url: str) -> tuple[str | None, list[tuple[str, str]]]:
@@ -177,6 +198,7 @@ def write_pipe(pipe, data: bytes) -> bool:
     try:
         pipe.write(data)
         pipe.flush()
+        state["bytes_piped"] += len(data)
         return True
     except (BrokenPipeError, OSError):
         return False
@@ -195,7 +217,7 @@ async def download_and_decrypt(
         resp.raise_for_status()
         with open(enc_path, "wb") as f:
             f.write(resp.content)
-        decrypt_file(enc_path, dec_path, keys)
+        await decrypt_file_async(enc_path, dec_path, keys)
         with open(dec_path, "rb") as f:
             return f.read()
     finally:
@@ -207,11 +229,30 @@ async def download_and_decrypt(
                 pass
 
 
+async def read_ffmpeg_stderr(proc: subprocess.Popen) -> None:
+    try:
+        if not proc.stderr:
+            return
+        loop = asyncio.get_running_loop()
+        while proc.poll() is None:
+            line = await loop.run_in_executor(None, proc.stderr.readline)
+            if not line:
+                break
+            decoded = line.decode("utf-8", errors="replace").strip()
+            if decoded:
+                state["ffmpeg_stderr"].append(decoded)
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        state["ffmpeg_stderr"].append(f"[stderr-reader] {exc}")
+
+
 def stop_pipeline_sync() -> None:
-    task = state.get("poll_task")
-    if task and not task.done():
-        task.cancel()
-    state["poll_task"] = None
+    for task_key in ("poll_task", "stderr_task"):
+        task = state.get(task_key)
+        if task and not task.done():
+            task.cancel()
+        state[task_key] = None
 
     proc = state.get("proc")
     if proc:
@@ -229,6 +270,8 @@ def stop_pipeline_sync() -> None:
                 proc.wait(timeout=2)
     state["proc"] = None
     state["active_key"] = None
+    state["active_mpd"] = None
+    state["init_sent"] = False
 
 
 def clean_dir(path: str) -> None:
@@ -246,21 +289,21 @@ def clean_dir(path: str) -> None:
 
 async def live_poller_loop(mpd_url: str, keys: list[str], headers: dict[str, str], proc: subprocess.Popen) -> None:
     seen: deque[str] = deque(maxlen=256)
-    init_sent = False
     cached_init_url: str | None = None
 
     async with httpx.AsyncClient(headers=headers, timeout=10.0, follow_redirects=True) as client:
         while proc.poll() is None:
+            state["last_poll_at"] = round(time.time(), 2)
             try:
                 mpd_resp = await client.get(mpd_url)
                 mpd_resp.raise_for_status()
                 init_url, candidates = parse_live_candidates(mpd_resp.text, mpd_url)
 
-                if init_url and (not init_sent or init_url != cached_init_url):
+                if init_url and (not state["init_sent"] or init_url != cached_init_url):
                     init_bytes = await download_and_decrypt(client, init_url, "init", keys)
                     if not write_pipe(proc.stdin, init_bytes):
                         break
-                    init_sent = True
+                    state["init_sent"] = True
                     cached_init_url = init_url
 
                 for idx, (token, seg_url) in enumerate(candidates):
@@ -272,11 +315,16 @@ async def live_poller_loop(mpd_url: str, keys: list[str], headers: dict[str, str
                     if not write_pipe(proc.stdin, seg_bytes):
                         return
                     seen.append(token)
+                    state["segments_piped"] += 1
+
+                state["last_error"] = None
 
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                print(f"[poller] warning: {exc}")
+                err_text = f"{type(exc).__name__}: {exc}"
+                state["last_error"] = err_text
+                print(f"[poller] warning: {err_text}")
 
             await asyncio.sleep(POLL_INTERVAL_SEC)
 
@@ -296,10 +344,14 @@ async def ensure_stream_running(mpd_url: str, raw_keys: str, headers: dict[str, 
         stop_pipeline_sync()
         clean_dir(HLS_DIR)
         clean_dir(WORK_DIR)
+        state["last_error"] = None
+        state["segments_piped"] = 0
+        state["bytes_piped"] = 0
+        state["ffmpeg_stderr"].clear()
 
         ffmpeg_cmd = [
             "ffmpeg",
-            "-loglevel", "error",
+            "-loglevel", "warning",
             "-fflags", "+genpts+discardcorrupt",
             "-i", "pipe:0",
             "-c", "copy",
@@ -310,9 +362,15 @@ async def ensure_stream_running(mpd_url: str, raw_keys: str, headers: dict[str, 
             "-hls_segment_filename", out_seg,
             out_m3u8,
         ]
-        proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
+        proc = subprocess.Popen(
+            ffmpeg_cmd,
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
         state["proc"] = proc
         state["active_key"] = session_key
+        state["active_mpd"] = mpd_url
+        state["stderr_task"] = asyncio.create_task(read_ffmpeg_stderr(proc))
         state["poll_task"] = asyncio.create_task(live_poller_loop(mpd_url, keys, headers, proc))
 
         for _ in range(32):
@@ -354,7 +412,34 @@ def health():
     return {
         "status": "ok",
         "ffmpeg_running": bool(proc and proc.poll() is None),
+        "last_error": state["last_error"],
     }
+
+
+@app.get("/debug")
+def debug():
+    proc = state.get("proc")
+    hls_files = []
+    if os.path.isdir(HLS_DIR):
+        for fname in sorted(os.listdir(HLS_DIR)):
+            fpath = os.path.join(HLS_DIR, fname)
+            if os.path.isfile(fpath):
+                hls_files.append({"name": fname, "size": os.path.getsize(fpath)})
+
+    return JSONResponse(
+        {
+            "ffmpeg_running": bool(proc and proc.poll() is None),
+            "ffmpeg_returncode": proc.returncode if proc else None,
+            "active_mpd": state["active_mpd"],
+            "init_sent": state["init_sent"],
+            "segments_piped": state["segments_piped"],
+            "bytes_piped": state["bytes_piped"],
+            "last_poll_at": state["last_poll_at"],
+            "last_error": state["last_error"],
+            "hls_files": hls_files,
+            "ffmpeg_stderr": list(state["ffmpeg_stderr"]),
+        }
+    )
 
 
 @app.get("/stream.m3u8")
@@ -399,7 +484,6 @@ async def get_segment(segment_name: str, request: Request):
     if file_size <= 0:
         raise HTTPException(status_code=404, detail="Segment not ready")
 
-    # Strip Range header so players/sniffers don't trigger 416 on small/rolling TS segments
     clean_headers = [(k, v) for k, v in request.scope.get("headers", []) if k.decode("latin1").lower() != "range"]
     request.scope["headers"] = clean_headers
 
